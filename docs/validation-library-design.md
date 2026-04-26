@@ -64,7 +64,7 @@ La gerarchia degli schema è:
 - `OptionalSchema<T>`: wrapper che avvolge un altro schema rendendolo applicabile anche al valore `undefined`. Il tipo risultante è `T | undefined`. Quando il valore è `undefined`, l'inner schema non viene invocato e la validazione passa silenziosamente. Dettagliato in 4.1.1.
 - `NullableSchema<T>`: wrapper analogo a `OptionalSchema`, ma per il valore `null`. Il tipo risultante è `T | null`. Dettagliato in 4.1.1.
 
-I constraint globali (di `ObjectSchema` e `ArraySchema`) sono oggetti `Constraint` ordinari, con lo stesso contratto definito in 4.2. L'unica particolarità è il tipo del valore che ricevono (l'intero oggetto o array) e il fatto che `parent` punta al contenitore della struttura composta, non a uno dei suoi elementi interni.
+I constraint globali (di `ObjectSchema` e `ArraySchema`) sono oggetti `ConstraintInterface` ordinari, con lo stesso contratto definito in 4.2. L'unica particolarità è il tipo del valore che ricevono (l'intero oggetto o array) e il fatto che `parent` punta al contenitore della struttura composta, non a uno dei suoi elementi interni.
 
 Tipi aggiuntivi previsti ma non necessariamente nel primo rilascio:
 
@@ -106,44 +106,62 @@ Lo schema base resta immutabile; il wrapper produce una nuova istanza con semant
 
 ### 4.2 Constraint
 
-Un **constraint** è una regola di validazione applicabile a un valore. È una classe istanziabile che estende una base comune `Constraint<T>`, dove `T` è il tipo (o union di tipi) che il constraint sa gestire.
+Un **constraint** è una regola di validazione applicabile a un valore. È un oggetto che implementa l'interfaccia `ConstraintInterface<T>`, dove `T` è il tipo (o union di tipi) che il constraint sa gestire.
 
 **Contratto.**
 
 Ogni constraint concreto dichiara:
 
 - Un **codice identificativo** stabile (campo `code`) che identifica il constraint nel sistema. Stringa costante, tipicamente UPPER_SNAKE_CASE (es. `'EMAIL'`, `'CIG_VALIDATOR'`, `'MIN_VALUE'`).
-- I **tipi di dato gestiti** a livello di type system: il generic `T` della classe base vincola il tipo accettato a compile-time e impedisce al compilatore di accettare `primitive<number>(new Email())` dove `Email` gestisce `string`.
+- L'**insieme dei codici di errore** che il constraint può produrre (campo `errorCodes`). Array di stringhe costanti che enumera tutte le violazioni concettualmente distinte gestite dal constraint. Vedi sotto per la convenzione di naming e per l'uso in introspezione/dev-mode check.
+- I **tipi di dato gestiti** a livello di type system: il generic `T` dell'interfaccia vincola il tipo accettato a compile-time e impedisce al compilatore di accettare `primitive<number>(new Email())` dove `Email` gestisce `string`.
 - I **tipi di dato gestiti** a livello runtime: il campo `handledTypes` è un array di `TypeKind` usato dall'engine per check difensivi e introspezione. I `TypeKind` sono un'enumerazione chiusa: `'string' | 'number' | 'boolean' | 'bigint' | 'date' | 'object' | 'array' | 'any'`.
-- I **gruppi di validazione** a cui appartiene il constraint, dichiarati come parametro del costruttore. Un constraint senza gruppi dichiarati è considerato attivo per tutte le invocazioni (indipendentemente dai gruppi attivi nel context).
+- I **gruppi di validazione** a cui appartiene il constraint, esposti come campo `groups` di sola lettura. Convenzione: il chiamante li passa come opzione del costruttore (`{ groups?: readonly string[] }`); un constraint senza gruppi dichiarati ha `groups` valorizzato all'array vuoto ed è considerato attivo per tutte le invocazioni (indipendentemente dai gruppi attivi nel context).
 - Un metodo `validate(value, context)` **asincrono** che esegue la validazione. Il metodo non ritorna nulla: registra gli errori via `context.addError(violation)`. Un constraint che non registra errori è considerato passato.
 
-**Struttura minima:**
+**Contratto:**
 
 ```
-abstract class Constraint<T = unknown> {
-  abstract readonly code: string;
-  abstract readonly handledTypes: readonly TypeKind[];
+interface ConstraintInterface<T = unknown> {
+  readonly code: string;
+  readonly errorCodes: readonly string[];
+  readonly handledTypes: readonly TypeKind[];
+  readonly groups: readonly string[];
+
+  validate(value: T, context: MutableValidationContext): Promise<void>;
+}
+```
+
+L'interfaccia è il **contratto pubblico**. Non prescrive un costruttore: ogni implementazione concreta è libera di definirne uno coerente con le proprie dipendenze. L'engine accetta qualunque oggetto che soddisfi l'interfaccia, indipendentemente dalla classe da cui proviene.
+
+Per evitare il boilerplate ripetitivo del campo `groups` (dichiarazione + assegnazione da `options.groups ?? []` nel costruttore), Placet fornisce una classe astratta opzionale `AbstractConstraint<T>` che implementa l'interfaccia con il default `groups = []` e accetta `{ groups?: readonly string[] }` dal costruttore. Estenderla è una **scorciatoia, non un obbligo**: i constraint nei seguenti esempi sono mostrati con implementazione diretta dell'interfaccia per chiarezza del contratto.
+
+**Convenzione di naming degli `errorCode`.** Gli errorCode seguono la forma `<CONSTRAINT_CODE>.<ERROR_NAME>`, dove `<CONSTRAINT_CODE>` coincide con il `code` del constraint e `<ERROR_NAME>` è una stringa UPPER_SNAKE_CASE che descrive la violazione specifica (es. `'EMAIL.FORMAT_INVALID'`, `'CIG_VALIDATOR.CHECKSUM_INVALID'`, `'MIN_VALUE.VIOLATED'`). Questa convenzione produce identificatori leggibili, greppabili nel codebase, gerarchicamente organizzati, e adatti come chiavi i18n (`errors.EMAIL.FORMAT_INVALID`).
+
+**Identificatori opachi (UUID, hash) sono sconsigliati.** Riducono la leggibilità nei log, non sono greppabili, complicano i18n e introducono frizione di scrittura senza risolvere un problema reale: la coppia `(constraintCode, errorCode)` esposta in `ValidationError` è già unica per costruzione all'interno del sistema. Per uniqueness cross-package, Placet 1.0 si affida alla convenzione di prefisso `<CONSTRAINT_CODE>.` — sufficiente nei contesti applicativi tipici.
+
+**Uso del campo `errorCodes`.** Tre scopi:
+
+1. **Introspezione** — tooling esterno può estrarre dall'albero degli schema il catalogo completo dei codici di errore producibili, utile per generare tabelle i18n, documentazione, dashboard di osservabilità.
+2. **Dev-mode check** — l'engine, in modalità sviluppo, può verificare che ogni `addError({ errorCode })` invocato da un constraint usi un codice presente nel suo `errorCodes` dichiarato; un codice non dichiarato è un bug del constraint e va segnalato (warning o eccezione, configurabile). In produzione il check è disabilitato per non pagare overhead.
+3. **Auto-documentazione** — leggendo la classe del constraint si conoscono immediatamente tutti i possibili esiti di validazione che produce.
+
+**Esempio — constraint mono-tipo senza dipendenze:**
+
+```
+class Email implements ConstraintInterface<string> {
+  readonly code = 'EMAIL';
+  readonly errorCodes = ['EMAIL.FORMAT_INVALID'] as const;
+  readonly handledTypes = ['string'] as const;
   readonly groups: readonly string[];
 
   constructor(options?: { groups?: readonly string[] }) {
     this.groups = options?.groups ?? [];
   }
 
-  abstract validate(value: T, context: MutableValidationContext): Promise<void>;
-}
-```
-
-**Esempio — constraint mono-tipo senza dipendenze:**
-
-```
-class Email extends Constraint<string> {
-  readonly code = 'EMAIL';
-  readonly handledTypes = ['string'] as const;
-
   async validate(value: string, ctx: MutableValidationContext): Promise<void> {
     if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(value)) {
-      ctx.addError({ errorCode: 'EMAIL_FORMAT_INVALID' });
+      ctx.addError({ errorCode: 'EMAIL.FORMAT_INVALID' });
     }
   }
 }
@@ -152,17 +170,22 @@ class Email extends Constraint<string> {
 **Esempio — constraint multi-tipo (concettualmente correlati):**
 
 ```
-class MinValue extends Constraint<number | bigint | Date> {
+class MinValue implements ConstraintInterface<number | bigint | Date> {
   readonly code = 'MIN_VALUE';
+  readonly errorCodes = ['MIN_VALUE.VIOLATED'] as const;
   readonly handledTypes = ['number', 'bigint', 'date'] as const;
+  readonly groups: readonly string[];
 
-  constructor(private readonly min: number | bigint | Date, options?: { groups?: string[] }) {
-    super(options);
+  constructor(
+    private readonly min: number | bigint | Date,
+    options?: { groups?: readonly string[] },
+  ) {
+    this.groups = options?.groups ?? [];
   }
 
   async validate(value: number | bigint | Date, ctx: MutableValidationContext): Promise<void> {
     if (value < this.min) {
-      ctx.addError({ errorCode: 'MIN_VALUE_VIOLATED', params: { min: this.min, actual: value } });
+      ctx.addError({ errorCode: 'MIN_VALUE.VIOLATED', params: { min: this.min, actual: value } });
     }
   }
 }
@@ -171,18 +194,23 @@ class MinValue extends Constraint<number | bigint | Date> {
 **Esempio — constraint stateful con dipendenza:**
 
 ```
-class UniqueEmail extends Constraint<string> {
+class UniqueEmail implements ConstraintInterface<string> {
   readonly code = 'UNIQUE_EMAIL';
+  readonly errorCodes = ['UNIQUE_EMAIL.ALREADY_TAKEN'] as const;
   readonly handledTypes = ['string'] as const;
+  readonly groups: readonly string[];
 
-  constructor(private readonly users: UserRepository, options?: { groups?: string[] }) {
-    super(options);
+  constructor(
+    private readonly users: UserRepository,
+    options?: { groups?: readonly string[] },
+  ) {
+    this.groups = options?.groups ?? [];
   }
 
   async validate(value: string, ctx: MutableValidationContext): Promise<void> {
     const existing = await this.users.findByEmail(value);
     if (existing) {
-      ctx.addError({ errorCode: 'EMAIL_ALREADY_TAKEN', params: { email: value } });
+      ctx.addError({ errorCode: 'UNIQUE_EMAIL.ALREADY_TAKEN', params: { email: value } });
     }
   }
 }
@@ -205,14 +233,20 @@ Il constraint fornisce `errorCode` (sempre), e opzionalmente `message`, `params`
 **Errori su path diverso dal corrente.** Il campo opzionale `path` in `ConstraintViolation` permette a un constraint di registrare un errore su un path diverso da quello in cui sta girando. Caso d'uso tipico: un constraint globale su un `ObjectSchema` che valida la coerenza tra due campi e vuole segnalare l'errore sul campo "sbagliato" (non sull'oggetto intero). Esempio:
 
 ```
-class PasswordsMatch extends Constraint<{ password: string; confirmPassword: string }> {
+class PasswordsMatch implements ConstraintInterface<{ password: string; confirmPassword: string }> {
   readonly code = 'PASSWORDS_MATCH';
+  readonly errorCodes = ['PASSWORDS_MATCH.MISMATCH'] as const;
   readonly handledTypes = ['object'] as const;
+  readonly groups: readonly string[];
+
+  constructor(options?: { groups?: readonly string[] }) {
+    this.groups = options?.groups ?? [];
+  }
 
   async validate(value: { password: string; confirmPassword: string }, ctx: MutableValidationContext): Promise<void> {
     if (value.password !== value.confirmPassword) {
       ctx.addError({
-        errorCode: 'PASSWORDS_MISMATCH',
+        errorCode: 'PASSWORDS_MATCH.MISMATCH',
         path: `${ctx.path}.confirmPassword`,  // errore attribuito a confirmPassword
       });
     }
@@ -322,13 +356,21 @@ La forma senza generic ritorna `unknown`: l'utente fa il type narrowing che deve
 
 ```
 // In un constraint cross-field:
-class ConfirmPasswordMatch implements Constraint {
-  async validate(value: unknown, ctx: ValidationContext) {
+class ConfirmPasswordMatch implements ConstraintInterface<string> {
+  readonly code = 'CONFIRM_PASSWORD_MATCH';
+  readonly errorCodes = ['CONFIRM_PASSWORD_MATCH.MISMATCH'] as const;
+  readonly handledTypes = ['string'] as const;
+  readonly groups: readonly string[];
+
+  constructor(options?: { groups?: readonly string[] }) {
+    this.groups = options?.groups ?? [];
+  }
+
+  async validate(value: string, ctx: MutableValidationContext): Promise<void> {
     const password = ctx.get<string>('$.password');
     if (value !== password) {
-      return /* error: passwords don't match */;
+      ctx.addError({ errorCode: 'CONFIRM_PASSWORD_MATCH.MISMATCH' });
     }
-    return /* ok */;
   }
 }
 
@@ -353,7 +395,7 @@ ValidationResult {
 ValidationError {
   path: string                       // "$.order.items[0].cig"
   constraintCode: string             // "CIG_VALIDATOR"
-  errorCode: string                  // "CIG_CHECKSUM_INVALID"
+  errorCode: string                  // "CIG_VALIDATOR.CHECKSUM_INVALID"
   message?: string                   // template o messaggio già formattato, se fornito dal constraint
   params?: Record<string, unknown>   // parametri per i18n/formattazione
   cause?: unknown                    // per debug (error originale)
@@ -370,7 +412,7 @@ SkippedConstraint {
 
 Questa separazione riflette la separazione di responsabilità: il constraint descrive **cosa** non va, l'engine sa **dove** e **chi**.
 
-**Identità dei campi.** Il `constraintCode` identifica univocamente il constraint che ha generato l'errore (il suo campo `code`). L'`errorCode` identifica quale delle possibili violazioni gestite dal constraint si è verificata. Questa separazione permette a un constraint di gestire più tipi di errore correlati mantenendo una tassonomia strutturata.
+**Identità dei campi.** Il `constraintCode` identifica univocamente il constraint che ha generato l'errore (il suo campo `code`). L'`errorCode` identifica quale delle possibili violazioni gestite dal constraint si è verificata, ed è una delle stringhe enumerate nel campo `errorCodes` del constraint. Questa separazione permette a un constraint di gestire più tipi di errore correlati mantenendo una tassonomia strutturata; per convenzione l'`errorCode` ha forma `<CONSTRAINT_CODE>.<ERROR_NAME>` (vedi 4.2).
 
 Il messaggio può essere un template con parametri (formattazione esterna, responsabilità dell'integratore) o una stringa già formattata. Placet non fa i18n nel core; fornisce i dati strutturati necessari all'integratore per farla.
 
@@ -450,6 +492,8 @@ Un constraint può dichiarare uno o più **gruppi** a cui appartiene, tramite il
 
 **Constraint senza gruppo dichiarato.** Un constraint che non dichiara alcun gruppo (array `groups` vuoto) è considerato **attivo per qualunque invocazione**, indipendentemente dai gruppi passati a `validate`. Questa è la scelta di default esplicita: senza gruppi dichiarati, il constraint viene sempre eseguito. Non esiste un gruppo `default` implicito che genererebbe ambiguità.
 
+**Default di `options.groups`.** Il default di `options.groups` è l'array vuoto `[]`. La semantica conseguente, derivata direttamente dalla regola di intersezione, è: vengono eseguiti **solo i constraint senza gruppi dichiarati**, mentre tutti i constraint che dichiarano almeno un gruppo sono saltati (registrati in `skipped[]` con reason `group-mismatch`). Questa è una scelta esplicita e va tenuta presente: il default non significa "esegui tutto", significa "esegui solo le regole non gruppate". Per eseguire constraint gruppati il chiamante deve passare esplicitamente i gruppi attivi (`{ groups: ['signup'] }`).
+
 I gruppi filtrano i constraint: non selezionano schemi, non modificano la struttura. Sono un metadato applicato alla singola regola di validazione.
 
 Esempi di uso: validare una `Gara` con regole diverse per stato "bozza" (minime), "pubblicazione" (stringenti + check ANAC), "archivio" (sola integrità). Ogni constraint dichiara a quali stati si applica, l'engine attiva i gruppi corrispondenti al momento della validazione.
@@ -527,7 +571,7 @@ validate<T>(
 ): Promise<ValidationResult>
 
 ValidateOptions<Ctx> {
-  groups?: readonly string[]           // gruppi attivi; default: [] (tutti i constraint attivi)
+  groups?: readonly string[]           // gruppi attivi; default: [] (vedi 6.1 per la semantica)
   custom?: Ctx                         // slot opaco propagato nel context
 }
 ```
@@ -561,7 +605,7 @@ chain([
 ])
 ```
 
-L'aggregatore è a sua volta un constraint (implementa lo stesso contratto `Constraint<T>`): può essere annidato, mescolato con constraint normali, trattato in modo omogeneo dall'engine.
+L'aggregatore è a sua volta un constraint (implementa lo stesso contratto `ConstraintInterface<T>`): può essere annidato, mescolato con constraint normali, trattato in modo omogeneo dall'engine.
 
 **Implementazione interna.** Per decidere se proseguire dopo ogni constraint della sequenza, la chain isola internamente l'esecuzione tramite un sub-context: ogni constraint della catena gira su un context derivato dedicato, che accumula le eventuali violazioni separatamente. Dopo l'invocazione, la chain ispeziona il sub-context: se sono state registrate violazioni, le travasa nel context padre e interrompe la sequenza registrando come `skipped` i constraint successivi; altrimenti procede al constraint successivo. Il constraint incapsulato dalla chain non sa di esserci: vede un `MutableValidationContext` standard.
 
@@ -645,7 +689,7 @@ Da chiudere prima o durante l'implementazione:
 
 Ordine suggerito, da affinare:
 
-1. Tipi core: `Schema<T>` base class e gerarchia (PrimitiveSchema, ObjectSchema, ArraySchema), `Constraint`, `ValidationContext`, `ValidationResult`, `ValidationError`.
+1. Tipi core: `Schema<T>` base class e gerarchia (PrimitiveSchema, ObjectSchema, ArraySchema), `ConstraintInterface`, `ValidationContext`, `ValidationResult`, `ValidationError`.
 2. Engine asincrono: traversal, accumulazione errori, propagazione path, parallelismo di base.
 3. Primi constraint di test (non orientati a business specifico, solo per esercitare l'engine): `NotNull`, `Satisfies(predicate)`.
 4. Chain aggregator e meccanismo skip.
@@ -661,7 +705,7 @@ Ordine suggerito, da affinare:
 ## 13. Glossario
 
 - **Schema**: descrittore di come validare un dato di tipo `T`. Istanza di una classe concreta (PrimitiveSchema, ObjectSchema, ArraySchema, ConditionalSchema, ...). Per convenzione ogni schema ha una factory function in lowercase (`object`, `array`, `conditional`, ...) come API d'uso pubblica.
-- **Constraint**: regola di validazione applicabile a un valore. Classe che estende `Constraint<T>`, dichiara `code`, `handledTypes` e (opzionalmente) `groups`; implementa `validate(value, ctx)` asincrono che registra violazioni via context.
+- **Constraint**: regola di validazione applicabile a un valore. Oggetto che implementa l'interfaccia `ConstraintInterface<T>`, dichiara `code`, `errorCodes`, `handledTypes`, `groups`; implementa `validate(value, ctx)` asincrono che registra violazioni via context.
 - **ValidationEngine**: classe che espone il metodo `validate(value, schema, options)` per eseguire la validazione. Unica API pubblica per invocare la validazione; va istanziata esplicitamente.
 - **Context**: oggetto che accompagna la validazione. Esiste in due forme: `ValidationContext` (read-only, per selector) e `MutableValidationContext` (read + `addError`, per constraint). Contiene path, root, parent, location, groups, custom e il metodo `get` per path query.
 - **ConstraintViolation**: struttura che un constraint registra via `ctx.addError(violation)`. Contiene `errorCode` (obbligatorio), `message`, `params`, `cause`, `path` (tutti opzionali). L'engine la completa con `constraintCode` e `path` producendo un `ValidationError`.
