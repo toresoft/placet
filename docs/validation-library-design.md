@@ -4,8 +4,8 @@
 
 **Nome del progetto:** Placet
 **Pacchetto npm:** `@toresoft/placet`
-**Stato:** 1.1 (design freeze, revisione completa)
-**Ultimo aggiornamento:** Aprile 2026
+**Stato:** 1.4 (semplificazione mapped type, normalizzazione interna ai wrapper)
+**Ultimo aggiornamento:** Maggio 2026
 
 ---
 
@@ -49,6 +49,15 @@ Async-first. L'API di validazione è interamente asincrona; i constraint sincron
 
 Separazione tra piano dei tipi e piano del runtime. Il sistema di tipi garantisce che uno schema sia coerente con il tipo TypeScript del dato da validare. Il runtime esegue la validazione. Le due cose sono indipendenti e testabili separatamente.
 
+Prerequisiti TypeScript. Placet richiede `strict: true`. Il flag `exactOptionalPropertyTypes: true` è **fortemente raccomandato**. Il comportamento runtime è identico nelle due configurazioni; cambia il livello di espressività e di safety durante la costruzione dello schema:
+
+- Con `exactOptionalPropertyTypes: true`, il sistema di tipi distingue rigorosamente "chiave opzionale" (`{ x?: T }`, dove il valore è di tipo `T` puro) da "valore opzionale" (`{ x: T | undefined }`, dove la chiave è obbligatoria ma il valore può essere `undefined`). Solo il secondo caso richiede il wrapper `optional`; per le chiavi opzionali si fornisce direttamente uno `Schema<T>`.
+- Senza il flag, le due forme sono indistinguibili: TypeScript normalizza qualunque chiave opzionale a valore di tipo `T | undefined`. Il mapped type di `ObjectSchema` non applica normalizzazioni implicite, quindi il wrapper `optional` è **obbligatorio** in tutti i casi in cui il tipo del valore include `undefined` (incluse le chiavi opzionali).
+
+Nota importante sul ruolo di `optional`: il wrapper riguarda il **valore `undefined`**, non l'assenza della chiave. L'assenza di una chiave dichiarata in `T` non è una violazione di Placet, perché l'engine — durante il traversal di un oggetto — controlla `key in value` e applica lo schema solo se la chiave è effettivamente presente; se è assente non fa nulla. La verifica strutturale ("la chiave required deve esistere a runtime") è demandata al layer di parsing/validazione a monte (vedi sezione 2 "Posizionamento"). Dettagli e matrice completa dei casi in 4.1.1 e 4.1.2.
+
+Il prerequisito raccomandato è documentato nel README; chi lo adotta ottiene il massimo dalla libreria.
+
 ## 4. Concetti del modello
 
 ### 4.1 Schema
@@ -62,7 +71,8 @@ La gerarchia degli schema è:
 - `ArraySchema<T>`: per array omogenei. Contiene una lista di **array constraint** (applicati all'array nel suo complesso: cardinalità, unicità, ordinamento, ecc.) e un **itemSchema** unico applicato a ciascun elemento. I constraint dell'array ricevono in `value` l'intero array; in questo caso `ctx.parent` è il contenitore dell'array. Il caso in cui elementi diversi dell'array richiedono schema diversi si risolve componendo `array(conditional(...))`: l'itemSchema è un conditional che sceglie, per ogni elemento, lo schema giusto in base al contesto e al valore. Non esiste un "secondo piano" di constraint per item separato dall'itemSchema: i constraint che valgono per ogni elemento fanno parte dello schema dell'item.
 - `ConditionalSchema<T>`: schema router che seleziona a runtime quale sotto-schema applicare, in base a un selector puro e sincrono. Dettagliato nella sezione 6.
 - `OptionalSchema<T>`: wrapper che avvolge un altro schema rendendolo applicabile anche al valore `undefined`. Il tipo risultante è `T | undefined`. Quando il valore è `undefined`, l'inner schema non viene invocato e la validazione passa silenziosamente. Dettagliato in 4.1.1.
-- `NullableSchema<T>`: wrapper analogo a `OptionalSchema`, ma per il valore `null`. Il tipo risultante è `T | null`. Dettagliato in 4.1.1.
+
+Per i valori che possono essere `null` non esiste un wrapper analogo: `null` è un valore esplicito di dominio e il suo trattamento è responsabilità dei constraint, che possono dichiarare `ConstraintInterface<T | null>` e gestire il caso `null` come fanno per qualunque altro valore. Vedi 4.1.1 per la motivazione.
 
 I constraint globali (di `ObjectSchema` e `ArraySchema`) sono oggetti `ConstraintInterface` ordinari, con lo stesso contratto definito in 4.2. L'unica particolarità è il tipo del valore che ricevono (l'intero oggetto o array) e il fatto che `parent` punta al contenitore della struttura composta, non a uno dei suoi elementi interni.
 
@@ -74,22 +84,49 @@ Tipi aggiuntivi previsti ma non necessariamente nel primo rilascio:
 
 Ogni schema porta nel suo tipo generico `T` il tipo TypeScript del dato che valida. Il sistema di tipi impedisce al momento della costruzione dello schema di associare un constraint al tipo sbagliato, dove possibile.
 
-**Convenzione di naming.** Ogni schema della gerarchia è accessibile in due forme: una classe in PascalCase (es. `ObjectSchema`, `ConditionalSchema`) e una factory function in lowercase (es. `object`, `conditional`). La factory è l'API d'uso pubblica e idiomatica; la classe è esposta per casi avanzati (sottoclassing, introspezione, instanceof check). Questa convenzione vale per tutti gli schema: `PrimitiveSchema`/`primitive`, `ObjectSchema`/`object`, `ArraySchema`/`array`, `ConditionalSchema`/`conditional`, `OptionalSchema`/`optional`, `NullableSchema`/`nullable`.
+**Convenzione di naming.** Ogni schema della gerarchia è accessibile in due forme: una classe in PascalCase (es. `ObjectSchema`, `ConditionalSchema`) e una factory function in lowercase (es. `object`, `conditional`). La factory è l'API d'uso pubblica e idiomatica; la classe è esposta per casi avanzati (sottoclassing, introspezione, instanceof check). Questa convenzione vale per tutti gli schema: `PrimitiveSchema`/`primitive`, `ObjectSchema`/`object`, `ArraySchema`/`array`, `ConditionalSchema`/`conditional`, `OptionalSchema`/`optional`.
 
-#### 4.1.1 Optional e Nullable come wrapper schema
+#### 4.1.1 Optional come wrapper schema
 
-`optional` e `nullable` sono factory che producono wrapper schema: prendono uno schema esistente e ne producono uno nuovo con semantica estesa. Questo li rende cittadini di prima classe della gerarchia, sullo stesso piano di `conditional` e `lazy`, e uniforma il modello: ogni operazione sugli schema è una funzione che prende schema e produce schema.
+`optional` è una factory che produce un wrapper schema: prende uno schema esistente e ne produce uno nuovo con semantica estesa. Questo lo rende cittadino di prima classe della gerarchia, sullo stesso piano di `conditional` e `lazy`, e uniforma il modello: ogni operazione sugli schema è una funzione che prende uno schema e ne produce un altro.
 
-**Semantica distinta.** I due modificatori coprono concetti diversi, ed è importante non confonderli:
+**Perché un wrapper solo per `undefined`, non per `null`.** `undefined` ha in TypeScript un significato strutturale che si interseca con la dichiarazione delle proprietà di un oggetto: una chiave opzionale (`{ x?: T }`) è la rappresentazione standard di "valore mancante", e senza `exactOptionalPropertyTypes` il sistema di tipi confonde "chiave assente" e "valore `undefined`". Il wrapper `optional` cattura questa zona grigia in modo dichiarativo, isolando i constraint dalla necessità di trattare il caso `undefined`. `null`, invece, è un **valore esplicito di dominio**: significa "questo campo ha un valore, ed è esplicitamente l'assenza di significato". Modellare questa decisione come uno short-circuit nascosto in un wrapper è semanticamente sbagliato; è una regola di business che appartiene al constraint, che la dichiara nel proprio tipo (`ConstraintInterface<T | null>`) e la gestisce esplicitamente.
 
-- `optional(schema)`: il valore può essere `undefined`, o — quando lo schema è applicato a una proprietà di un oggetto — la proprietà può essere completamente assente. Il tipo risultante è `Schema<T | undefined>`, corrispondente al pattern `{ x?: T }` o `{ x: T | undefined }` in TypeScript (con `exactOptionalPropertyTypes` la differenza tra i due è rilevante e va presa in considerazione nell'implementazione).
-- `nullable(schema)`: il valore può essere esplicitamente `null`. Il tipo risultante è `Schema<T | null>`. Una proprietà `nullable` deve comunque essere presente nell'oggetto: `null` è un valore, `undefined` è assenza.
+**Quando servono e quando non servono.** Una distinzione fondamentale, da non confondere: la "opzionalità di una chiave" e la "opzionalità di un valore" sono concetti diversi in TypeScript. Placet le tratta in modo coerente in entrambe le configurazioni di `exactOptionalPropertyTypes`, ma la distinzione è visibile al sistema di tipi solo quando il flag è attivo:
 
-**Combinabilità.** I due wrapper sono componibili senza limiti. `optional(nullable(schema))` e `nullable(optional(schema))` producono entrambi `Schema<T | null | undefined>`; l'ordine di composizione non cambia la semantica. Questo è tipico di API REST che accettano sia "campo assente" sia "campo esplicitamente null" come rappresentazioni equivalenti di un valore mancante.
+- **Chiave opzionale** (`{ x?: T }`): la chiave può essere assente nell'oggetto, ma la sua eventuale presenza deve poter essere validata — lo schema va sempre dichiarato. Con `exactOptionalPropertyTypes: true`, quando la chiave è presente il valore è `T` puro: lo schema atteso dal mapped type è `Schema<T>` e si fornisce direttamente, **senza `optional`** (il wrapper produrrebbe `Schema<T | undefined>`, non assegnabile alla posizione). Senza il flag, TypeScript normalizza la chiave a valore `T | undefined`: lo schema atteso è `Schema<T | undefined>`, quindi **`optional` è obbligatorio** anche per le chiavi opzionali. In entrambi i casi l'engine applica lo schema solo quando la chiave è effettivamente presente nell'oggetto (`key in value`).
 
-**Short-circuit della validazione.** Quando il wrapper riconosce il valore modificatore (`undefined` per optional, `null` per nullable), l'inner schema non viene invocato: i constraint interni non hanno senso su un valore assente o null, e invocarli produrrebbe errori spuri. Questo comportamento è parte della semantica del wrapper e non è configurabile.
+- **Valore opzionale** (`T | undefined`, esplicito nel tipo): la chiave è presente, il valore può essere `undefined`. È una proprietà del valore stesso, non della chiave. Con `exactOptionalPropertyTypes: true`, **richiede `optional`**: lo schema deve essere `Schema<T | undefined>`, prodotto da `optional(schema)`. Senza il flag, TypeScript non distingue questo caso da una chiave opzionale: i due casi collassano e per entrambi `optional` è obbligatorio.
 
-**Riconoscimento selettivo.** Ogni wrapper riconosce **solo** il proprio valore modificatore: `optional` short-circuita solo su `undefined`, `nullable` solo su `null`. Un `optional(schema)` invocato con `null` passa `null` all'inner schema, che probabilmente lo rifiuterà; simmetricamente `nullable(schema)` con `undefined` passa `undefined` all'inner. Per accettare entrambi i valori modificatori si compongono i wrapper: `optional(nullable(schema))` produce `Schema<T | null | undefined>` e short-circuita su entrambi.
+- **Valore nullable** (`T | null`, esplicito nel tipo): il valore può essere `null`, che è sempre un valore esplicito di dominio. Non esiste un wrapper dedicato: lo schema atteso è semplicemente `Schema<T | null>` e si costruisce con `primitive(...)` (o lo schema appropriato) tipizzato sul tipo unione. I constraint che lo validano dichiarano `ConstraintInterface<T | null>` e trattano `null` come qualunque altro valore — short-circuit interno, errore, o accettazione esplicita, secondo la regola di business.
+
+Esempio concreto (con `exactOptionalPropertyTypes: true`):
+
+```
+type User = {
+  email?: string;              // chiave opzionale → niente optional (con EOPT)
+  phone: string | undefined;   // valore opzionale → richiede optional
+  bio: string | null;          // valore nullable → constraint che gestisce null
+  name: string;                // required → schema diretto
+};
+
+const userSchema = object<User>({
+  email: primitive(new Email()),                       // Schema<string>, gestita come chiave opzionale
+  phone: optional(primitive(new PhoneFormat())),       // Schema<string | undefined>
+  bio: primitive<string | null>(new MaxLength(500)),   // Schema<string | null>; MaxLength accetta null
+  name: primitive(new NotBlank()),                     // Schema<string>
+});
+```
+
+Senza `exactOptionalPropertyTypes`, `email` e `phone` sarebbero indistinguibili a livello di tipi (entrambe `string | undefined`) e per entrambe sarebbe **obbligatorio** il wrapper `optional`: il mapped type non normalizza, quindi `Schema<string>` non sarebbe assegnabile alla posizione `Schema<string | undefined>`.
+
+In tutti i casi e con qualunque configurazione, **i constraint dentro un `OptionalSchema` vedono sempre `T` puro**, mai `undefined`: il short-circuit del wrapper e il vincolo strutturale di `OptionalSchema` sull'inner schema (vedi sotto) garantiscono che `Email.validate` riceva solo stringhe. I constraint dentro uno schema tipizzato `Schema<T | null>` vedono invece `T | null` esplicitamente — gestire `null` è loro responsabilità per progetto.
+
+**Semantica del wrapper.**
+
+`optional(schema)` produce `Schema<T | undefined>` da uno `Schema<T>`. A runtime short-circuita quando il valore è `undefined`: l'inner schema non viene invocato e la validazione passa silenziosamente. La definizione strutturale di `OptionalSchema` vincola il proprio `innerSchema` ad avere il tipo del valore senza `undefined` (`Schema<Exclude<U, undefined>>`, dove `U` è il tipo esposto esternamente dal wrapper): la rimozione di `undefined` dal tipo dell'inner schema è una proprietà del wrapper, garantita dal suo costruttore, non un'operazione del mapped type di `ObjectSchema`.
+
+**Riconoscimento selettivo.** `optional` short-circuita solo su `undefined`. Invocato su `null` passa `null` all'inner schema, che probabilmente lo rifiuterà — il che è coerente: se un campo è dichiarato `T | undefined` (non `T | null | undefined`), allora `null` è un valore non ammesso e l'inner schema deve segnalarlo. Per campi che ammettono entrambi `null` e `undefined` si dichiara il tipo come `T | null | undefined` e si compone: `optional(...)` con un inner `Schema<T | null>` i cui constraint accettano `null`.
 
 **Riusabilità.** Un beneficio architetturale dei wrapper come funzioni è che lo stesso schema base può essere riusato in contesti required e optional senza duplicazione:
 
@@ -97,12 +134,33 @@ Ogni schema porta nel suo tipo generico `T` il tipo TypeScript del dato che vali
 const phoneSchema = primitive(new PhoneFormat());
 
 const contactSchema = object({
-  primary: phoneSchema,              // required
-  secondary: optional(phoneSchema),  // stesso schema base, reso optional qui
+  primary: phoneSchema,              // required, valore string puro
+  emergency: optional(phoneSchema),  // valore string | undefined
 });
 ```
 
 Lo schema base resta immutabile; il wrapper produce una nuova istanza con semantica estesa.
+
+#### 4.1.2 Mapped type per ObjectSchema
+
+`ObjectSchema<T>` è parametrizzato sul tipo dell'oggetto da validare. La mappa di properties dello schema è vincolata, tramite mapped type, a essere coerente con la struttura di `T`. Il vincolo distingue le chiavi required dalle chiavi opzionali e per entrambe usa direttamente il tipo del valore `T[K]`, senza alcuna normalizzazione implicita:
+
+```
+type ObjectProperties<T extends object> = { readonly [K in keyof T]-?: Schema<T[K]> }
+```
+
+Il mapped type esprime due garanzie:
+
+- Per ogni chiave di `T`, required o opzionale, lo schema corrispondente deve essere dichiarato e di tipo `Schema<T[K]>`. Il compilatore rifiuta schemi mancanti, schemi del tipo sbagliato, e chiavi extra non presenti in `T`.
+- L'opzionalità strutturale di una chiave (`{ x?: T }`) riguarda la sua eventuale assenza nell'oggetto a runtime, non l'obbligo di dichiararle uno schema: se la chiave può essere presente, deve poter essere validata. Il `-?` rimuove l'opzionalità della dichiarazione dello schema, imponendo che tutte le chiavi di `T` siano coperte.
+
+Per le chiavi il cui tipo include `undefined` — siano chiavi opzionali o required — l'utente usa `optional(...)` per fornire uno schema compatibile con `Schema<T[K]>`. Per le chiavi il cui tipo include `null`, lo schema atteso è `Schema<T | null>` e si costruisce direttamente, con constraint che dichiarano `ConstraintInterface<T | null>` (vedi 4.1.1).
+
+**Niente normalizzazione nel mapped type.** A differenza di una versione precedente del design (che applicava `Exclude<T[K], undefined>` alle chiavi opzionali), il mapped type qui passa il tipo `T[K]` "liscio". La rimozione di `undefined` dal tipo dell'inner schema è una responsabilità di `OptionalSchema`, che la impone strutturalmente nel proprio costruttore. Questa scelta separa le responsabilità: `ObjectSchema` non sa nulla dell'opzionalità del valore; è il wrapper `optional` a garantire che i constraint contenuti non vedano mai `undefined`.
+
+La conseguenza pratica è che la matrice di casi diventa più semplice: il wrapper `optional` è necessario ogni volta che il tipo del valore atteso include `undefined` (sia con sia senza `exactOptionalPropertyTypes`). Con il flag attivo, le chiavi opzionali "vere" (`{ x?: T }`) hanno valore `T` puro e quindi usano direttamente `Schema<T>`; senza il flag, qualunque opzionalità di chiave si manifesta come `T | undefined` e richiede `optional`.
+
+L'engine, durante il traversal di un oggetto, itera sulle chiavi di `ObjectProperties` e per ciascuna controlla se la chiave è presente nell'oggetto (`key in value`): se sì, applica lo schema al valore; se no, non fa nulla (la chiave era opzionale nel tipo e assente nell'istanza). Proprietà presenti nell'oggetto ma non in `T` sono ignorate.
 
 ### 4.2 Constraint
 
@@ -113,22 +171,22 @@ Un **constraint** è una regola di validazione applicabile a un valore. È un og
 Ogni constraint concreto dichiara:
 
 - Un **codice identificativo** stabile (campo `code`) che identifica il constraint nel sistema. Stringa costante, tipicamente UPPER_SNAKE_CASE (es. `'EMAIL'`, `'CIG_VALIDATOR'`, `'MIN_VALUE'`).
-- L'**insieme dei codici di errore** che il constraint può produrre (campo `errorCodes`). Array di stringhe costanti che enumera tutte le violazioni concettualmente distinte gestite dal constraint. Vedi sotto per la convenzione di naming e per l'uso in introspezione/dev-mode check.
+- L'**insieme dei codici di errore** che il constraint può produrre (campo `errorCodes`). `ReadonlySet<string>` che enumera tutte le violazioni concettualmente distinte gestite dal constraint. Vedi sotto per la convenzione di naming e per l'uso in introspezione/dev-mode check.
 - I **tipi di dato gestiti** a livello di type system: il generic `T` dell'interfaccia vincola il tipo accettato a compile-time e impedisce al compilatore di accettare `primitive<number>(new Email())` dove `Email` gestisce `string`.
-- I **tipi di dato gestiti** a livello runtime: il campo `handledTypes` è un array di `TypeKind` usato dall'engine per check difensivi e introspezione. I `TypeKind` sono un'enumerazione chiusa: `'string' | 'number' | 'boolean' | 'bigint' | 'date' | 'object' | 'array' | 'any'`.
-- I **gruppi di validazione** a cui appartiene il constraint, esposti come campo `groups` di sola lettura. Convenzione: il chiamante li passa come opzione del costruttore (`{ groups?: readonly string[] }`); un constraint senza gruppi dichiarati ha `groups` valorizzato all'array vuoto ed è considerato attivo per tutte le invocazioni (indipendentemente dai gruppi attivi nel context).
-- Un metodo `validate(value, context)` **asincrono** che esegue la validazione. Il metodo non ritorna nulla: registra gli errori via `context.addError(violation)`. Un constraint che non registra errori è considerato passato.
+- I **tipi di dato gestiti** a livello runtime: il campo `handledTypes` è un `ReadonlySet<TypeKind>` usato dall'engine per check difensivi e introspezione. I `TypeKind` sono un'enumerazione chiusa: `'string' | 'number' | 'boolean' | 'bigint' | 'date' | 'object' | 'array' | 'any'`.
+- I **gruppi di validazione** a cui appartiene il constraint, esposti come campo `groups: ReadonlySet<string>` di sola lettura. Convenzione: il chiamante li passa come opzione del costruttore (`{ groups?: readonly string[] }`) e il constraint li converte in Set; un constraint senza gruppi dichiarati ha `groups` valorizzato a un Set vuoto ed è considerato attivo per tutte le invocazioni (indipendentemente dai gruppi attivi nel context).
+- Un metodo `validate(value, context)` **asincrono** che esegue la validazione. Il metodo non ritorna nulla: registra le violation via `context.addViolation(violation)`. Un constraint che non registra violation è considerato passato.
 
 **Contratto:**
 
 ```
 interface ConstraintInterface<T = unknown> {
   readonly code: string;
-  readonly errorCodes: readonly string[];
-  readonly handledTypes: readonly TypeKind[];
-  readonly groups: readonly string[];
+  readonly errorCodes: ReadonlySet<string>;
+  readonly handledTypes: ReadonlySet<TypeKind>;
+  readonly groups: ReadonlySet<string>;
 
-  validate(value: T, context: MutableValidationContext): Promise<void>;
+  validate(value: T, context: ConstraintContext): Promise<void>;
 }
 ```
 
@@ -136,14 +194,14 @@ L'interfaccia è il **contratto pubblico**. Non prescrive un costruttore: ogni i
 
 Per evitare il boilerplate ripetitivo del campo `groups` (dichiarazione + assegnazione da `options.groups ?? []` nel costruttore), Placet fornisce una classe astratta opzionale `AbstractConstraint<T>` che implementa l'interfaccia con il default `groups = []` e accetta `{ groups?: readonly string[] }` dal costruttore. Estenderla è una **scorciatoia, non un obbligo**: i constraint nei seguenti esempi sono mostrati con implementazione diretta dell'interfaccia per chiarezza del contratto.
 
-**Convenzione di naming degli `errorCode`.** Gli errorCode seguono la forma `<CONSTRAINT_CODE>.<ERROR_NAME>`, dove `<CONSTRAINT_CODE>` coincide con il `code` del constraint e `<ERROR_NAME>` è una stringa UPPER_SNAKE_CASE che descrive la violazione specifica (es. `'EMAIL.FORMAT_INVALID'`, `'CIG_VALIDATOR.CHECKSUM_INVALID'`, `'MIN_VALUE.VIOLATED'`). Questa convenzione produce identificatori leggibili, greppabili nel codebase, gerarchicamente organizzati, e adatti come chiavi i18n (`errors.EMAIL.FORMAT_INVALID`).
+**Convenzione di naming dei codici di errore (campo `code` su `ConstraintViolation` e `Violation`).** Il valore segue la forma `<CONSTRAINT_CODE>.<ERROR_NAME>`, dove `<CONSTRAINT_CODE>` coincide con il `code` del constraint e `<ERROR_NAME>` è una stringa UPPER_SNAKE_CASE che descrive la violazione specifica (es. `'EMAIL.FORMAT_INVALID'`, `'CIG_VALIDATOR.CHECKSUM_INVALID'`, `'MIN_VALUE.VIOLATED'`). Questa convenzione produce identificatori leggibili, greppabili nel codebase, gerarchicamente organizzati, e adatti come chiavi i18n (`errors.EMAIL.FORMAT_INVALID`).
 
-**Identificatori opachi (UUID, hash) sono sconsigliati.** Riducono la leggibilità nei log, non sono greppabili, complicano i18n e introducono frizione di scrittura senza risolvere un problema reale: la coppia `(constraintCode, errorCode)` esposta in `ValidationError` è già unica per costruzione all'interno del sistema. Per uniqueness cross-package, Placet 1.0 si affida alla convenzione di prefisso `<CONSTRAINT_CODE>.` — sufficiente nei contesti applicativi tipici.
+**Identificatori opachi (UUID, hash) sono sconsigliati.** Riducono la leggibilità nei log, non sono greppabili, complicano i18n e introducono frizione di scrittura senza risolvere un problema reale: la coppia `(constraintCode, code)` esposta in `Violation` è già unica per costruzione all'interno del sistema. Per uniqueness cross-package, Placet 1.0 si affida alla convenzione di prefisso `<CONSTRAINT_CODE>.` — sufficiente nei contesti applicativi tipici.
 
 **Uso del campo `errorCodes`.** Tre scopi:
 
 1. **Introspezione** — tooling esterno può estrarre dall'albero degli schema il catalogo completo dei codici di errore producibili, utile per generare tabelle i18n, documentazione, dashboard di osservabilità.
-2. **Dev-mode check** — l'engine, in modalità sviluppo, può verificare che ogni `addError({ errorCode })` invocato da un constraint usi un codice presente nel suo `errorCodes` dichiarato; un codice non dichiarato è un bug del constraint e va segnalato (warning o eccezione, configurabile). In produzione il check è disabilitato per non pagare overhead.
+2. **Dev-mode check** — l'engine, in modalità sviluppo, può verificare che ogni `addViolation({ code })` invocato da un constraint usi un codice presente nel suo `errorCodes` dichiarato; un codice non dichiarato è un bug del constraint e va segnalato (warning o eccezione, configurabile). In produzione il check è disabilitato per non pagare overhead.
 3. **Auto-documentazione** — leggendo la classe del constraint si conoscono immediatamente tutti i possibili esiti di validazione che produce.
 
 **Esempio — constraint mono-tipo senza dipendenze:**
@@ -151,17 +209,17 @@ Per evitare il boilerplate ripetitivo del campo `groups` (dichiarazione + assegn
 ```
 class Email implements ConstraintInterface<string> {
   readonly code = 'EMAIL';
-  readonly errorCodes = ['EMAIL.FORMAT_INVALID'] as const;
-  readonly handledTypes = ['string'] as const;
-  readonly groups: readonly string[];
+  readonly errorCodes: ReadonlySet<string> = new Set(['EMAIL.FORMAT_INVALID']);
+  readonly handledTypes: ReadonlySet<TypeKind> = new Set(['string']);
+  readonly groups: ReadonlySet<string>;
 
   constructor(options?: { groups?: readonly string[] }) {
-    this.groups = options?.groups ?? [];
+    this.groups = new Set(options?.groups ?? []);
   }
 
-  async validate(value: string, ctx: MutableValidationContext): Promise<void> {
+  async validate(value: string, ctx: ConstraintContext): Promise<void> {
     if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(value)) {
-      ctx.addError({ errorCode: 'EMAIL.FORMAT_INVALID' });
+      ctx.addViolation({ code: 'EMAIL.FORMAT_INVALID' });
     }
   }
 }
@@ -172,20 +230,20 @@ class Email implements ConstraintInterface<string> {
 ```
 class MinValue implements ConstraintInterface<number | bigint | Date> {
   readonly code = 'MIN_VALUE';
-  readonly errorCodes = ['MIN_VALUE.VIOLATED'] as const;
-  readonly handledTypes = ['number', 'bigint', 'date'] as const;
-  readonly groups: readonly string[];
+  readonly errorCodes: ReadonlySet<string> = new Set(['MIN_VALUE.VIOLATED']);
+  readonly handledTypes: ReadonlySet<TypeKind> = new Set(['number', 'bigint', 'date']);
+  readonly groups: ReadonlySet<string>;
 
   constructor(
     private readonly min: number | bigint | Date,
     options?: { groups?: readonly string[] },
   ) {
-    this.groups = options?.groups ?? [];
+    this.groups = new Set(options?.groups ?? []);
   }
 
-  async validate(value: number | bigint | Date, ctx: MutableValidationContext): Promise<void> {
+  async validate(value: number | bigint | Date, ctx: ConstraintContext): Promise<void> {
     if (value < this.min) {
-      ctx.addError({ errorCode: 'MIN_VALUE.VIOLATED', params: { min: this.min, actual: value } });
+      ctx.addViolation({ code: 'MIN_VALUE.VIOLATED', params: { min: this.min, actual: value } });
     }
   }
 }
@@ -196,31 +254,31 @@ class MinValue implements ConstraintInterface<number | bigint | Date> {
 ```
 class UniqueEmail implements ConstraintInterface<string> {
   readonly code = 'UNIQUE_EMAIL';
-  readonly errorCodes = ['UNIQUE_EMAIL.ALREADY_TAKEN'] as const;
-  readonly handledTypes = ['string'] as const;
-  readonly groups: readonly string[];
+  readonly errorCodes: ReadonlySet<string> = new Set(['UNIQUE_EMAIL.ALREADY_TAKEN']);
+  readonly handledTypes: ReadonlySet<TypeKind> = new Set(['string']);
+  readonly groups: ReadonlySet<string>;
 
   constructor(
     private readonly users: UserRepository,
     options?: { groups?: readonly string[] },
   ) {
-    this.groups = options?.groups ?? [];
+    this.groups = new Set(options?.groups ?? []);
   }
 
-  async validate(value: string, ctx: MutableValidationContext): Promise<void> {
+  async validate(value: string, ctx: ConstraintContext): Promise<void> {
     const existing = await this.users.findByEmail(value);
     if (existing) {
-      ctx.addError({ errorCode: 'UNIQUE_EMAIL.ALREADY_TAKEN', params: { email: value } });
+      ctx.addViolation({ code: 'UNIQUE_EMAIL.ALREADY_TAKEN', params: { email: value } });
     }
   }
 }
 ```
 
-**Produzione di errori.** Il constraint registra errori via `context.addError(violation)`, dove `violation` ha shape:
+**Produzione di violation.** Il constraint registra violation via `context.addViolation(violation)`, dove `violation` ha shape:
 
 ```
 ConstraintViolation {
-  errorCode: string                    // codice dell'errore (obbligatorio)
+  code: string                         // codice di errore (obbligatorio)
   message?: string                     // messaggio (template o già formattato)
   params?: Record<string, unknown>     // parametri per i18n/formattazione
   cause?: unknown                      // error originale, per debug
@@ -228,26 +286,26 @@ ConstraintViolation {
 }
 ```
 
-Il constraint fornisce `errorCode` (sempre), e opzionalmente `message`, `params`, `cause`. L'engine **inietta automaticamente** il `path` del valore corrente e il `constraintCode` del constraint invocante, costruendo il `ValidationError` finale senza duplicazione di informazioni.
+Il constraint fornisce `code` (sempre), e opzionalmente `message`, `params`, `cause`. L'engine **inietta automaticamente** il `path` del valore corrente e il `constraintCode` del constraint invocante, costruendo la `Violation` finale senza duplicazione di informazioni.
 
 **Errori su path diverso dal corrente.** Il campo opzionale `path` in `ConstraintViolation` permette a un constraint di registrare un errore su un path diverso da quello in cui sta girando. Caso d'uso tipico: un constraint globale su un `ObjectSchema` che valida la coerenza tra due campi e vuole segnalare l'errore sul campo "sbagliato" (non sull'oggetto intero). Esempio:
 
 ```
 class PasswordsMatch implements ConstraintInterface<{ password: string; confirmPassword: string }> {
   readonly code = 'PASSWORDS_MATCH';
-  readonly errorCodes = ['PASSWORDS_MATCH.MISMATCH'] as const;
-  readonly handledTypes = ['object'] as const;
-  readonly groups: readonly string[];
+  readonly errorCodes: ReadonlySet<string> = new Set(['PASSWORDS_MATCH.MISMATCH']);
+  readonly handledTypes: ReadonlySet<TypeKind> = new Set(['object']);
+  readonly groups: ReadonlySet<string>;
 
   constructor(options?: { groups?: readonly string[] }) {
-    this.groups = options?.groups ?? [];
+    this.groups = new Set(options?.groups ?? []);
   }
 
-  async validate(value: { password: string; confirmPassword: string }, ctx: MutableValidationContext): Promise<void> {
+  async validate(value: { password: string; confirmPassword: string }, ctx: ConstraintContext): Promise<void> {
     if (value.password !== value.confirmPassword) {
-      ctx.addError({
-        errorCode: 'PASSWORDS_MATCH.MISMATCH',
-        path: `${ctx.path}.confirmPassword`,  // errore attribuito a confirmPassword
+      ctx.addViolation({
+        code: 'PASSWORDS_MATCH.MISMATCH',
+        path: `${ctx.path}.confirmPassword`,  // violation attribuita a confirmPassword
       });
     }
   }
@@ -273,45 +331,51 @@ Lo schema è un valore immutabile; i constraint sono immutabili (le loro dipende
 
 ### 4.3 Validation Context
 
-Il **context** è l'oggetto che accompagna l'esecuzione di una validazione. Contiene tutto ciò che un constraint o un selector può aver bisogno di sapere oltre al valore che sta validando, e (nel caso dei constraint) il canale per registrare errori.
+Il **context** è l'oggetto che accompagna l'esecuzione di una validazione. Contiene tutto ciò che un constraint o un selector può aver bisogno di sapere oltre al valore che sta validando, e (nel caso dei constraint) il canale per registrare violation.
 
 Placet distingue due forme del context, con responsabilità diverse:
 
-- **`ValidationContext`** (read-only): esposto ai *selector* dei conditional schema. Permette solo lettura di dati contestuali. Un selector è un puro router: non può e non deve registrare errori.
-- **`MutableValidationContext`** (read + write): esposto ai *constraint* nel loro metodo `validate`. Estende `ValidationContext` aggiungendo il metodo `addError` per registrare violazioni nel risultato.
+- **`SelectorContext`** (read-only): esposto ai *selector* dei conditional schema. Permette solo lettura di dati contestuali. Un selector è un puro router: non può e non deve registrare violation.
+- **`ConstraintContext`** (read + write): esposto ai *constraint* nel loro metodo `validate`. Estende `SelectorContext` aggiungendo il metodo `addViolation` per registrare violation nel risultato.
 
-**Shape di `ValidationContext`:**
+**Shape di `SelectorContext`:**
 
 - `path`: percorso testuale che identifica la posizione corrente nel traversal, nella stessa sintassi del path query (sezione 4.3.2). Al top-level della validazione il path è `$`; per una proprietà al primo livello è `$.field`; per un elemento di array al primo livello è `$[0]`; per strutture più profonde le notazioni si compongono (`$.items[3].customer.name`). Il path è calcolato e propagato dall'engine.
 - `root`: il valore top-level passato a `validate()`. Punto di riferimento per path query assoluti e per validazioni cross-field che devono confrontarsi con l'intero albero.
 - `parent`: l'entità che contiene il dato corrente. Se il valore corrente è una proprietà di un oggetto, `parent` è quell'oggetto; se è un elemento di un array, `parent` è l'array; al top-level `parent` è `undefined`. Nota: quando si valida un `ObjectSchema` nel suo complesso (constraint globale sull'oggetto), il valore corrente è l'oggetto stesso e `parent` è il contenitore dell'oggetto (l'oggetto padre, o `undefined` se l'oggetto è al top-level).
 - `location`: informazioni strutturali del punto corrente (vedi 4.3.1).
-- `groups`: l'insieme dei gruppi di validazione attivi per l'esecuzione corrente.
+- `groups`: l'insieme dei gruppi di validazione attivi per l'esecuzione corrente, esposto come `ReadonlySet<string>`.
 - `custom`: slot opaco per l'utente. Qui il chiamante mette le sue dipendenze (repository, service, DataLoader, utente corrente, locale, tenant, ecc.). Placet non interpreta questo campo.
+- `violations`: lista (read-only) delle `Violation` registrate finora e visibili da questo context. Per il context principale dell'engine = tutte le violation della validazione corrente. Per un sub-context isolato (chain, vedi 7.4) = solo quelle del sub-context. Utile a constraint che vogliano comportarsi diversamente in base allo stato accumulato e alle chain per ispezionare l'esito dei constraint incapsulati.
 - `get(path)`: metodo per accedere a un valore nell'albero tramite path query (vedi 4.3.2).
 
-**Shape di `MutableValidationContext`:**
+**Shape di `ConstraintContext`:**
 
-Tutto ciò che è in `ValidationContext`, più:
+Tutto ciò che è in `SelectorContext`, più:
 
-- `addError(violation: ConstraintViolation): void`: registra un errore nel risultato della validazione in corso. La shape di `ConstraintViolation` è definita in 4.2 (sezione Constraint). L'engine inietta automaticamente `path` (se non fornito dal constraint) e `constraintCode`, completando le informazioni del `ValidationError` finale.
+- `addViolation(violation: ConstraintViolation): void`: registra una violation nel risultato della validazione in corso. La shape di `ConstraintViolation` è definita in 4.2 (sezione Constraint). L'engine inietta automaticamente `path` (se non fornito dal constraint) e `constraintCode`, completando le informazioni della `Violation` finale.
 
-Un constraint può invocare `addError` zero, una o più volte in una singola esecuzione di `validate`, a seconda di quante violazioni concettualmente distinte ha riscontrato.
+Un constraint può invocare `addViolation` zero, una o più volte in una singola esecuzione di `validate`, a seconda di quante violation concettualmente distinte ha riscontrato.
 
 #### 4.3.1 Location strutturale
 
-Il campo `location` espone le informazioni di posizione del valore corrente rispetto al suo contenitore immediato, in forma strutturata (non testuale come il `path`). Shape:
+Il campo `location` espone le informazioni di posizione del valore corrente rispetto al suo contenitore immediato, in forma strutturata (non testuale come il `path`). È una **discriminated union** sul campo `kind`:
 
 ```
-location {
-  index?: number      // valorizzato se il valore è elemento di un array
-  key?: string        // valorizzato se il valore è proprietà di un oggetto
-}
+type Location =
+  | { readonly kind: 'root' }
+  | { readonly kind: 'array'; readonly index: number }
+  | { readonly kind: 'object'; readonly key: string };
 ```
 
-Al top-level della validazione entrambi i campi sono `undefined`. Dentro un array, `index` è l'indice dell'elemento corrente. Dentro un oggetto, `key` è il nome della proprietà corrente.
+Al top-level della validazione `location` vale `{ kind: 'root' }`. Dentro un array, `{ kind: 'array', index }` con `index` indice dell'elemento corrente. Dentro un oggetto, `{ kind: 'object', key }` con `key` nome della proprietà corrente. Nessun altro stato è rappresentabile (TypeScript impedisce stati invalidi come "entrambi i campi presenti" o "nessuno e non-root").
 
-Questa informazione è disponibile sia ai constraint sia ai selector dei conditional schema. È particolarmente utile nei selector che devono comportarsi diversamente in base alla posizione: ad esempio, "il primo elemento di un array ha regole diverse dagli altri" si esprime come un conditional il cui selector usa `ctx.location.index === 0`.
+Questa informazione è disponibile sia ai constraint sia ai selector dei conditional schema. È particolarmente utile nei selector che devono comportarsi diversamente in base alla posizione: ad esempio, "il primo elemento di un array ha regole diverse dagli altri" si esprime come un conditional il cui selector fa narrowing su `kind`:
+
+```
+selector: (ctx, value) =>
+  ctx.location.kind === 'array' && ctx.location.index === 0 ? 'HEAD' : 'TAIL'
+```
 
 Il `path` testuale resta disponibile per logging, tracing e produzione di messaggi di errore; `location` è pensato per la logica decisionale perché non richiede parsing.
 
@@ -336,7 +400,7 @@ $["field"].sub              combinazione di notazioni
 
 **Regole.**
 
-- Il path **deve essere assoluto**: inizia sempre con `$`, che rappresenta la root. Placet non supporta percorsi relativi. Per accedere al valore corrente o al suo contenitore immediato si usano i campi dedicati del context (`parent`, `location.index`, `location.key`), che sono più chiari e type-safe di qualunque sintassi relativa.
+- Il path **deve essere assoluto**: inizia sempre con `$`, che rappresenta la root. Placet non supporta percorsi relativi. Per accedere al valore corrente o al suo contenitore immediato si usano i campi dedicati del context (`parent` e i rami della discriminated union `location` — vedi 4.3.1), che sono più chiari e type-safe di qualunque sintassi relativa.
 - I separatori ammessi sono `.` tra identificatori JavaScript validi e `[...]` per indici numerici (interi non negativi) e chiavi stringa (racchiuse in virgolette doppie). La bracket notation con stringa è sempre disponibile come alternativa al dot, utile per chiavi con caratteri speciali (punti, trattini, spazi).
 - **Percorsi inesistenti o interrotti ritornano `undefined`**, non lanciano eccezioni. La semantica è analoga all'optional chaining di JavaScript: se a un qualunque livello il valore è `null`, `undefined` o non contiene la chiave richiesta, il risultato complessivo è `undefined`. Un constraint che vuole distinguere "percorso assente" da "percorso presente con valore undefined" può confrontare esplicitamente il risultato.
 - Indici negativi, wildcard, filtri, slicing e funzioni **non sono supportati**. Un tentativo di usarli produce un errore di parsing del path, non un'interpretazione alternativa.
@@ -358,18 +422,18 @@ La forma senza generic ritorna `unknown`: l'utente fa il type narrowing che deve
 // In un constraint cross-field:
 class ConfirmPasswordMatch implements ConstraintInterface<string> {
   readonly code = 'CONFIRM_PASSWORD_MATCH';
-  readonly errorCodes = ['CONFIRM_PASSWORD_MATCH.MISMATCH'] as const;
-  readonly handledTypes = ['string'] as const;
-  readonly groups: readonly string[];
+  readonly errorCodes: ReadonlySet<string> = new Set(['CONFIRM_PASSWORD_MATCH.MISMATCH']);
+  readonly handledTypes: ReadonlySet<TypeKind> = new Set(['string']);
+  readonly groups: ReadonlySet<string>;
 
   constructor(options?: { groups?: readonly string[] }) {
-    this.groups = options?.groups ?? [];
+    this.groups = new Set(options?.groups ?? []);
   }
 
-  async validate(value: string, ctx: MutableValidationContext): Promise<void> {
+  async validate(value: string, ctx: ConstraintContext): Promise<void> {
     const password = ctx.get<string>('$.password');
     if (value !== password) {
-      ctx.addError({ errorCode: 'CONFIRM_PASSWORD_MATCH.MISMATCH' });
+      ctx.addViolation({ code: 'CONFIRM_PASSWORD_MATCH.MISMATCH' });
     }
   }
 }
@@ -381,21 +445,21 @@ const contractSchema = conditional({
 });
 ```
 
-### 4.4 Validation Result e Error
+### 4.4 Validation Result e Violation
 
 Il risultato complessivo di una validazione ha shape:
 
 ```
 ValidationResult {
   valid: boolean
-  errors: ValidationError[]
+  violations: Violation[]
   skipped: SkippedConstraint[]      // constraint non eseguiti (chain, gruppi, ...)
 }
 
-ValidationError {
+Violation {
   path: string                       // "$.order.items[0].cig"
   constraintCode: string             // "CIG_VALIDATOR"
-  errorCode: string                  // "CIG_VALIDATOR.CHECKSUM_INVALID"
+  code: string                       // "CIG_VALIDATOR.CHECKSUM_INVALID"
   message?: string                   // template o messaggio già formattato, se fornito dal constraint
   params?: Record<string, unknown>   // parametri per i18n/formattazione
   cause?: unknown                    // per debug (error originale)
@@ -408,11 +472,11 @@ SkippedConstraint {
 }
 ```
 
-**Costruzione degli errori.** Un `ValidationError` è sempre costruito dall'engine, non dal constraint. Il constraint registra una `ConstraintViolation` (via `ctx.addError`, vedi 4.2) che contiene le informazioni che *solo lui* conosce: `errorCode`, eventuale `message`, `params`, `cause`, eventuale `path` di override. L'engine compone questa violazione con i dati che *lui* conosce — il `constraintCode` del constraint invocante e il `path` corrente del traversal — producendo il `ValidationError` finale.
+**Costruzione delle violation.** Una `Violation` è sempre costruita dall'engine, non dal constraint. Il constraint registra una `ConstraintViolation` (via `ctx.addViolation`, vedi 4.2) che contiene le informazioni che *solo lui* conosce: `code`, eventuale `message`, `params`, `cause`, eventuale `path` di override. L'engine compone questa `ConstraintViolation` con i dati che *lui* conosce — il `constraintCode` del constraint invocante e il `path` corrente del traversal — producendo la `Violation` finale.
 
 Questa separazione riflette la separazione di responsabilità: il constraint descrive **cosa** non va, l'engine sa **dove** e **chi**.
 
-**Identità dei campi.** Il `constraintCode` identifica univocamente il constraint che ha generato l'errore (il suo campo `code`). L'`errorCode` identifica quale delle possibili violazioni gestite dal constraint si è verificata, ed è una delle stringhe enumerate nel campo `errorCodes` del constraint. Questa separazione permette a un constraint di gestire più tipi di errore correlati mantenendo una tassonomia strutturata; per convenzione l'`errorCode` ha forma `<CONSTRAINT_CODE>.<ERROR_NAME>` (vedi 4.2).
+**Identità dei campi.** Il `constraintCode` identifica univocamente il constraint che ha generato la violation (il suo campo `code`). Il `code` (sulla `Violation`) identifica quale delle possibili violazioni gestite dal constraint si è verificata, ed è una delle stringhe enumerate nel campo `errorCodes` del constraint. Questa separazione permette a un constraint di gestire più tipi di violation correlate mantenendo una tassonomia strutturata; per convenzione il `code` ha forma `<CONSTRAINT_CODE>.<ERROR_NAME>` (vedi 4.2).
 
 Il messaggio può essere un template con parametri (formattazione esterna, responsabilità dell'integratore) o una stringa già formattata. Placet non fa i18n nel core; fornisce i dati strutturati necessari all'integratore per farla.
 
@@ -520,7 +584,7 @@ Il selector è una funzione che riceve il context corrente e il valore da valida
 
 **Signature del selector.** Il selector riceve `(ctx, value)`:
 
-- `ctx`: il `ValidationContext` corrente (forma read-only, come descritto in 4.3). Include `path`, `root`, `parent`, `location`, `groups`, `custom`. Particolarmente utile `ctx.location` per selector che devono decidere in base alla posizione del valore (es. "il primo elemento di un array ha regole diverse dagli altri": `selector: (ctx, value) => ctx.location.index === 0 ? 'HEAD' : 'TAIL'`).
+- `ctx`: il `SelectorContext` corrente (forma read-only, come descritto in 4.3). Include `path`, `root`, `parent`, `location`, `groups`, `custom`, `violations`. Particolarmente utile `ctx.location` per selector che devono decidere in base alla posizione del valore (es. "il primo elemento di un array ha regole diverse dagli altri": `selector: (ctx, value) => ctx.location.kind === 'array' && ctx.location.index === 0 ? 'HEAD' : 'TAIL'`).
 - `value`: il valore correntemente oggetto di validazione, già del tipo atteso. Se il conditional è al top-level, `value` coincide con il valore passato a `engine.validate`; se è annidato (proprietà di oggetto, elemento di array, dentro un altro conditional), `value` è il valore a quel punto del traversal.
 
 **Regole del conditional:**
@@ -607,7 +671,7 @@ chain([
 
 L'aggregatore è a sua volta un constraint (implementa lo stesso contratto `ConstraintInterface<T>`): può essere annidato, mescolato con constraint normali, trattato in modo omogeneo dall'engine.
 
-**Implementazione interna.** Per decidere se proseguire dopo ogni constraint della sequenza, la chain isola internamente l'esecuzione tramite un sub-context: ogni constraint della catena gira su un context derivato dedicato, che accumula le eventuali violazioni separatamente. Dopo l'invocazione, la chain ispeziona il sub-context: se sono state registrate violazioni, le travasa nel context padre e interrompe la sequenza registrando come `skipped` i constraint successivi; altrimenti procede al constraint successivo. Il constraint incapsulato dalla chain non sa di esserci: vede un `MutableValidationContext` standard.
+**Implementazione interna.** Per decidere se proseguire dopo ogni constraint della sequenza, la chain isola internamente l'esecuzione tramite un sub-context: ogni constraint della catena gira su un context derivato dedicato, che accumula le eventuali violation separatamente. Dopo l'invocazione, la chain ispeziona il sub-context (via `violations`): se sono state registrate violation, le travasa nel context padre e interrompe la sequenza registrando come `skipped` i constraint successivi; altrimenti procede al constraint successivo. Il constraint incapsulato dalla chain non sa di esserci: vede un `ConstraintContext` standard.
 
 ### 7.5 Skip e propagazione
 
@@ -650,7 +714,7 @@ Nel primo rilascio:
 - `ObjectSchema` per oggetti con forma nota.
 - `ArraySchema` per array omogenei.
 - `conditional` per selezione runtime di schema.
-- `optional` e `nullable` come wrapper per modificatori strutturali.
+- `optional` come wrapper per il modificatore strutturale `undefined`.
 - `lazy` per schema ricorsivi.
 
 Previsti in rilasci successivi:
@@ -683,19 +747,18 @@ Da chiudere prima o durante l'implementazione:
 3. **Abort early globale**: opzione per interrompere al primo errore raccogliendo solo quello. Default `false`, ma utile averlo per certi casi di rate limiting o fail-fast.
 4. **Identità dei constraint uguali applicati più volte**: se lo stesso constraint è applicato due volte allo stesso campo con parametri diversi, come li distinguiamo negli errori? Via `constraintCode` unico? Via discriminante aggiuntivo?
 5. **Sintassi della factory `array()`**: argomenti posizionali (`array(itemSchema, [arrayConstraints])`) vs oggetto di configurazione (`array({ items, constraints })`). La prima è più corta per il caso comune (solo item schema); la seconda è più esplicita e scalabile. Valutare coerenza con le altre factory (`object`, `conditional`).
-6. **Interazione `optional` e proprietà di oggetto**: con `exactOptionalPropertyTypes`, la differenza tra `{ x?: T }` (proprietà assente consentita) e `{ x: T | undefined }` (proprietà presente ma valore undefined) è rilevante. Scegliere quale forma produce `optional` su una proprietà di `object`, e se permettere entrambe.
 
 ## 12. Roadmap di implementazione
 
 Ordine suggerito, da affinare:
 
-1. Tipi core: `Schema<T>` base class e gerarchia (PrimitiveSchema, ObjectSchema, ArraySchema), `ConstraintInterface`, `ValidationContext`, `ValidationResult`, `ValidationError`.
+1. Tipi core: `Schema<T>` base class e gerarchia (PrimitiveSchema, ObjectSchema, ArraySchema), `ConstraintInterface`, `SelectorContext` / `ConstraintContext`, `ValidationResult`, `Violation`.
 2. Engine asincrono: traversal, accumulazione errori, propagazione path, parallelismo di base.
 3. Primi constraint di test (non orientati a business specifico, solo per esercitare l'engine): `NotNull`, `Satisfies(predicate)`.
 4. Chain aggregator e meccanismo skip.
 5. Gruppi di validazione nel context e filtro nell'engine.
 6. `conditional` schema con selector e mappa di casi.
-7. `optional` e `nullable` come wrapper schema.
+7. `optional` come wrapper schema.
 8. `lazy` per ricorsione.
 9. Path query sul context.
 10. Pattern DataLoader documentato ed esempi end-to-end.
@@ -705,17 +768,17 @@ Ordine suggerito, da affinare:
 ## 13. Glossario
 
 - **Schema**: descrittore di come validare un dato di tipo `T`. Istanza di una classe concreta (PrimitiveSchema, ObjectSchema, ArraySchema, ConditionalSchema, ...). Per convenzione ogni schema ha una factory function in lowercase (`object`, `array`, `conditional`, ...) come API d'uso pubblica.
-- **Constraint**: regola di validazione applicabile a un valore. Oggetto che implementa l'interfaccia `ConstraintInterface<T>`, dichiara `code`, `errorCodes`, `handledTypes`, `groups`; implementa `validate(value, ctx)` asincrono che registra violazioni via context.
+- **ObjectProperties**: mapped type che vincola la mappa di properties di un `ObjectSchema<T>` a essere strutturalmente coerente con `T`. Richiede uno schema per **ogni** chiave di `T` — required o opzionale — con tipo `Schema<T[K]>`, passando il tipo del valore "liscio" senza normalizzazioni. L'opzionalità strutturale di una chiave riguarda la sua eventuale assenza a runtime, non l'obbligo di dichiararle uno schema. La rimozione di `undefined` dal tipo dell'inner schema è responsabilità di `OptionalSchema`; `null`, essendo un valore esplicito di dominio, è gestito direttamente dai constraint.
+- **Constraint**: regola di validazione applicabile a un valore. Oggetto che implementa l'interfaccia `ConstraintInterface<T>`, dichiara `code`, `errorCodes`, `handledTypes`, `groups` (gli ultimi tre come `ReadonlySet<...>`); implementa `validate(value, ctx)` asincrono che registra violation via `ctx.addViolation`.
 - **ValidationEngine**: classe che espone il metodo `validate(value, schema, options)` per eseguire la validazione. Unica API pubblica per invocare la validazione; va istanziata esplicitamente.
-- **Context**: oggetto che accompagna la validazione. Esiste in due forme: `ValidationContext` (read-only, per selector) e `MutableValidationContext` (read + `addError`, per constraint). Contiene path, root, parent, location, groups, custom e il metodo `get` per path query.
-- **ConstraintViolation**: struttura che un constraint registra via `ctx.addError(violation)`. Contiene `errorCode` (obbligatorio), `message`, `params`, `cause`, `path` (tutti opzionali). L'engine la completa con `constraintCode` e `path` producendo un `ValidationError`.
+- **Context**: oggetto che accompagna la validazione. Esiste in due forme: `SelectorContext` (read-only, per selector) e `ConstraintContext` (read + `addViolation`, per constraint). Contiene path, root, parent, location, groups, custom, violations e il metodo `get` per path query.
+- **ConstraintViolation**: struttura che un constraint registra via `ctx.addViolation(violation)`. Contiene `code` (obbligatorio), `message`, `params`, `cause`, `path` (tutti opzionali). L'engine la completa con `constraintCode` e `path` producendo una `Violation`.
 - **TypeKind**: enumerazione chiusa dei tipi di dato riconosciuti da Placet a livello runtime (`'string' | 'number' | 'boolean' | 'bigint' | 'date' | 'object' | 'array' | 'any'`). Usata nel campo `handledTypes` dei constraint.
 - **Chain**: aggregatore di constraint che impone esecuzione sequenziale con short-circuit al primo fallimento. Implementato come constraint-aggregatore che gira sub-context isolati per rilevare fallimenti dei constraint incapsulati.
 - **Group**: etichetta applicata a un constraint tramite il parametro `groups` del costruttore; l'engine esegue solo i constraint i cui gruppi intersecano quelli attivi nel context. Un constraint senza gruppi dichiarati è attivo per qualunque invocazione.
 - **Conditional**: schema router che, dato un selector e una mappa di casi, sceglie a runtime quale schema applicare.
 - **Selector**: funzione pura e sincrona `(context, value) => key` usata dal conditional per scegliere il caso.
-- **Optional**: wrapper schema che estende uno schema rendendolo applicabile anche al valore `undefined` (o all'assenza della proprietà in un oggetto). Produce `Schema<T | undefined>`. Riconosce solo `undefined`; per accettare anche `null` comporre con `nullable`.
-- **Nullable**: wrapper schema che estende uno schema rendendolo applicabile anche al valore `null`. Produce `Schema<T | null>`. Riconosce solo `null`; componibile con optional.
+- **Optional**: wrapper schema che estende uno schema rendendolo applicabile anche al valore `undefined`. Produce `Schema<T | undefined>` da `Schema<T>`. Internamente vincola il proprio `innerSchema` a `Schema<Exclude<T, undefined>>`, garantendo per costruzione che l'inner non veda mai `undefined`. Necessario per valori esplicitamente opzionali (`{ x: T | undefined }`); con `exactOptionalPropertyTypes: true` non è applicabile alle chiavi opzionali (`{ x?: T }`), che hanno valore `T` puro e usano direttamente `Schema<T>`; senza il flag è obbligatorio anche per le chiavi opzionali, perché TypeScript le normalizza a `T | undefined`. Riconosce solo `undefined`. Non esiste un wrapper analogo per `null`: i valori nullable sono gestiti direttamente dai constraint (vedi 4.1.1).
 - **Location**: campo strutturato del context che espone la posizione del valore corrente rispetto al suo contenitore (indice se in array, chiave se in oggetto), usabile dai selector e dai constraint senza dover fare parsing del path testuale.
 - **Path query**: stringa di path assoluto (inizia con `$`) che identifica una posizione nell'albero del dato validato. Accessibile via `ctx.get(path)`. Sintassi minimale: `.` per identificatori, `[n]` per indici, `["string"]` per chiavi con caratteri speciali. Percorsi inesistenti ritornano `undefined`.
 - **Lazy**: wrapper che posticipa la risoluzione di uno schema al momento dell'uso, necessario per schema ricorsivi.

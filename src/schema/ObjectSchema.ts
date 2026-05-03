@@ -1,11 +1,7 @@
 import {Schema} from "./Schema";
 import {ConstraintInterface} from "../constraint/ConstraintInterface";
 
-export type ObjectProperties<T extends object> = {
-    readonly [K in keyof T]-?: Schema<
-        undefined extends T[K] ? T[K] : T[K] | (object extends Pick<T, K> ? undefined : never)
-    >;
-};
+export type ObjectProperties<T extends object> = { readonly [K in keyof T]-?: Schema<T[K]> }
 
 export class ObjectSchema<T extends object> extends Schema<T> {
     readonly properties: ObjectProperties<T>;

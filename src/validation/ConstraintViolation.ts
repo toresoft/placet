@@ -1,5 +1,5 @@
 export type ConstraintViolation = {
-    errorCode: string
+    code: string
     message?: string
     params?: Record<string, unknown>
     cause?: unknown

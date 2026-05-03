@@ -1,10 +1,13 @@
-import {ValidationError} from "./ValidationError";
+import {Violation} from "./Violation";
+import {SkippedConstraint} from "./SkippedConstraint";
 
 export class ValidationResult {
-    readonly errors: ValidationError[];
+    readonly violations: Violation[];
     readonly valid: boolean;
-    constructor(errors: ValidationError[], valid: boolean) {
-        this.errors = errors;
-        this.valid = valid;
+    readonly skipped: SkippedConstraint[];
+    constructor(violations: Violation[], skipped: SkippedConstraint[]) {
+        this.violations = violations;
+        this.valid = violations.length === 0;
+        this.skipped = skipped;
     }
 }
